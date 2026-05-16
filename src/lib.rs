@@ -55,8 +55,30 @@ impl<'a> Request<'a> {
         Ok(body)
     }
 
-    pub fn copy_body_to_stream<T: ?Sized>(&mut self, write_stream : &mut T) where T: Write{
-        std::io::copy(self.stream, write_stream);
+    pub fn copy_body_to_stream<T: ?Sized>(&mut self, write_stream: &mut T) -> std::io::Result<()>
+    where
+        T: Write,
+    {
+        write_stream.write_all(&self.body_head)?;
+        if let Some(content_length) = self.get_header::<usize>("content-length") {
+            let mut remaining = content_length.saturating_sub(self.body_head.len());
+            let mut buf = [0u8; 8192];
+            while remaining > 0 {
+                let to_read = remaining.min(buf.len());
+                let n = self.stream.read(&mut buf[..to_read])?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "eof",
+                    ));
+                }
+                write_stream.write_all(&buf[..n])?;
+                remaining -= n;
+            }
+        } else {
+            std::io::copy(self.stream, write_stream)?;
+        }
+        Ok(())
     }
 }
 
