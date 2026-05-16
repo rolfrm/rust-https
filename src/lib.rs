@@ -54,6 +54,10 @@ impl<'a> Request<'a> {
         }
         Ok(body)
     }
+
+    pub fn copy_body_to_stream<T: ?Sized>(&mut self, write_stream : &mut T) where T: Write{
+        std::io::copy(self.stream, write_stream);
+    }
 }
 
 fn status_reason(status: u16) -> &'static str {
