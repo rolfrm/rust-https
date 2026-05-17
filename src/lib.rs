@@ -3,12 +3,15 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
+pub trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
 pub struct Request<'a> {
     pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body_head: Vec<u8>,
-    stream: &'a mut dyn Read,
+    pub stream: &'a mut dyn ReadWrite,
 }
 
 impl std::fmt::Debug for Request<'_> {
@@ -31,17 +34,39 @@ impl<'a> Request<'a> {
             .and_then(|(_, v)| v.parse().ok())
     }
 
-    pub fn response(&self, status: u16, body: impl AsRef<[u8]>, content_type: &str) -> Vec<u8> {
+    pub fn response(&mut self, status: u16, body: impl AsRef<[u8]>, content_type: &str) -> std::io::Result<()> {
         let body = body.as_ref();
         let reason = status_reason(status);
-        format!(
+        write!(
+            self.stream,
             "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
             body.len(),
-        )
-        .into_bytes()
-        .into_iter()
-        .chain(body.iter().copied())
-        .collect()
+        )?;
+        self.stream.write_all(body)?;
+        Ok(())
+    }
+
+    pub fn response_from_stream(
+        &mut self,
+        status: u16,
+        content_length: u64,
+        content_type: &str,
+        reader: impl Read,
+    ) -> std::io::Result<()> {
+        let reason = status_reason(status);
+        write!(
+            self.stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {content_length}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
+        )?;
+        let mut reader = reader;
+        std::io::copy(&mut reader, &mut self.stream)?;
+        Ok(())
+    }
+
+    pub fn response_from_file(&mut self, status: u16, path: &str, content_type: &str) -> std::io::Result<()> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        self.response_from_stream(status, len, content_type, file)
     }
 
     pub fn read_body(&mut self) -> std::io::Result<Vec<u8>> {
@@ -105,7 +130,7 @@ fn status_reason(status: u16) -> &'static str {
     }
 }
 
-pub type Handler = Arc<dyn for<'a> Fn(Request<'a>) -> Vec<u8> + Send + Sync>;
+pub type Handler = Arc<dyn for<'a> Fn(Request<'a>) -> std::io::Result<()> + Send + Sync>;
 
 pub enum Server {
     Http(TcpListener),
@@ -131,7 +156,7 @@ impl Server {
 
     pub fn serve<F>(self, handler: F)
     where
-        F: for<'a> Fn(Request<'a>) -> Vec<u8> + Send + Sync + 'static,
+        F: for<'a> Fn(Request<'a>) -> std::io::Result<()> + Send + Sync + 'static,
     {
         let handler = Arc::new(handler);
         match self {
@@ -211,12 +236,11 @@ pub(crate) fn handle(mut stream: impl Read + Write, handler: Handler) -> std::io
     let header_bytes = &buf[..header_end.saturating_sub(4)];
 
     let req = parse_request(header_bytes, extra, &mut stream);
-    let res = handler(req);
-    stream.write_all(&res)?;
+    handler(req)?;
     Ok(())
 }
 
-fn parse_request<'a>(header_bytes: &[u8], extra: &[u8], stream: &'a mut dyn Read) -> Request<'a> {
+fn parse_request<'a>(header_bytes: &[u8], extra: &[u8], stream: &'a mut dyn ReadWrite) -> Request<'a> {
     let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
     let mut lines = header_str.lines();
 
@@ -274,16 +298,14 @@ mod tests {
     fn get_empty_body() {
         let req = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let mut cur = Cursor::new(req.to_vec());
-        let handler: Handler = Arc::new(|r: Request| {
+        let handler: Handler = Arc::new(|mut r: Request| {
             assert_eq!(r.method, "GET");
             assert_eq!(r.path, "/");
             assert_eq!(r.headers[0], ("Host".into(), "localhost".into()));
             assert!(r.body_head.is_empty());
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()
+            r.response(200, "ok", "text/plain")
         });
         handle(&mut cur, handler).unwrap();
-        let resp = String::from_utf8(cur.into_inner()).unwrap();
-        assert!(resp.ends_with("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"));
     }
 
     #[test]
@@ -294,19 +316,17 @@ mod tests {
             assert_eq!(r.method, "POST");
             let body = r.read_body().unwrap();
             assert_eq!(body, b"hello");
-            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nreceived".to_vec()
+            r.response(200, "received", "text/plain")
         });
         handle(&mut cur, handler).unwrap();
-        let resp = String::from_utf8(cur.into_inner()).unwrap();
-        assert!(resp.ends_with("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nreceived"));
     }
 
     #[test]
-    fn handler_output_is_response() {
+    fn handler_writes_response() {
         let req = b"GET / HTTP/1.1\r\n\r\n";
         let mut cur = Cursor::new(req.to_vec());
-        let handler: Handler = Arc::new(|_: Request| {
-            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!".to_vec()
+        let handler: Handler = Arc::new(|mut r: Request| {
+            r.response(200, "Hello, World!", "text/plain")
         });
         handle(&mut cur, handler).unwrap();
         let resp = String::from_utf8(cur.into_inner()).unwrap();
@@ -320,7 +340,7 @@ mod tests {
         let handler: Handler = Arc::new(|mut r: Request| {
             let body = r.read_body().unwrap();
             assert!(body.is_empty());
-            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
+            r.response(200, "", "text/plain")
         });
         handle(&mut cur, handler).unwrap();
     }
@@ -335,8 +355,24 @@ mod tests {
         let handler: Handler = Arc::new(|mut r: Request| {
             let buf = r.read_body().unwrap();
             assert_eq!(buf, b"hello");
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()
+            r.response(200, "ok", "text/plain")
         });
         handle(&mut cur, handler).unwrap();
+    }
+
+    #[test]
+    fn response_from_file_ok() {
+        let dir = std::env::temp_dir().join("opencode_test_response_from_file.txt");
+        std::fs::write(&dir, b"file content").unwrap();
+        let req = b"GET / HTTP/1.1\r\n\r\n";
+        let mut cur = Cursor::new(req.to_vec());
+        let path = dir.to_string_lossy().to_string();
+        let handler: Handler = Arc::new(move |mut r: Request| {
+            r.response_from_file(200, &path, "text/plain")
+        });
+        handle(&mut cur, handler).unwrap();
+        let resp = String::from_utf8(cur.into_inner()).unwrap();
+        assert!(resp.ends_with("file content"));
+        let _ = std::fs::remove_file(&dir);
     }
 }
