@@ -34,12 +34,23 @@ impl<'a> Request<'a> {
             .and_then(|(_, v)| v.parse().ok())
     }
 
-    pub fn response(&mut self, status: u16, body: impl AsRef<[u8]>, content_type: &str) -> std::io::Result<()> {
+    pub fn get_header_string(&self, name: &str) -> Option<String>{
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| Some(v.clone()))
+    }
+
+    pub fn response(&mut self, status: u16, body: impl AsRef<[u8]>, content_type: &str, headers: &[(&str, &str)]) -> std::io::Result<()> {
         let body = body.as_ref();
         let reason = status_reason(status);
+        let mut extra = String::new();
+        for (k, v) in headers {
+            extra.push_str(&format!("{k}: {v}\r\n"));
+        }
         write!(
             self.stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n{extra}\r\n",
             body.len(),
         )?;
         self.stream.write_all(body)?;
@@ -51,22 +62,27 @@ impl<'a> Request<'a> {
         status: u16,
         content_length: u64,
         content_type: &str,
+        headers: &[(&str, &str)],
         reader: impl Read,
     ) -> std::io::Result<()> {
         let reason = status_reason(status);
+        let mut extra = String::new();
+        for (k, v) in headers {
+            extra.push_str(&format!("{k}: {v}\r\n"));
+        }
         write!(
             self.stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Length: {content_length}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {content_length}\r\nContent-Type: {content_type}\r\nConnection: close\r\n{extra}\r\n",
         )?;
         let mut reader = reader;
         std::io::copy(&mut reader, &mut self.stream)?;
         Ok(())
     }
 
-    pub fn response_from_file(&mut self, status: u16, path: &str, content_type: &str) -> std::io::Result<()> {
+    pub fn response_from_file(&mut self, status: u16, path: &str, content_type: &str, headers: &[(&str, &str)]) -> std::io::Result<()> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        self.response_from_stream(status, len, content_type, file)
+        self.response_from_stream(status, len, content_type, headers, file)
     }
 
     pub fn read_body(&mut self) -> std::io::Result<Vec<u8>> {
@@ -240,6 +256,26 @@ pub(crate) fn handle(mut stream: impl Read + Write, handler: Handler) -> std::io
     Ok(())
 }
 
+fn sanitize_path(path: &str) -> String {
+    let mut segments = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => match segments.pop() {
+                Some(_) => continue,
+                None => continue,
+            },
+            _ => segments.push(seg),
+        }
+    }
+    let result = segments.join("/");
+    if path.starts_with('/') {
+        format!("/{result}")
+    } else {
+        result
+    }
+}
+
 fn parse_request<'a>(header_bytes: &[u8], extra: &[u8], stream: &'a mut dyn ReadWrite) -> Request<'a> {
     let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
     let mut lines = header_str.lines();
@@ -247,7 +283,7 @@ fn parse_request<'a>(header_bytes: &[u8], extra: &[u8], stream: &'a mut dyn Read
     let request_line = lines.next().unwrap_or("");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     let method = parts.first().unwrap_or(&"").to_string();
-    let path = parts.get(1).unwrap_or(&"").to_string();
+    let path = sanitize_path(parts.get(1).unwrap_or(&""));
 
     let mut headers = Vec::new();
     for line in lines {
@@ -303,7 +339,7 @@ mod tests {
             assert_eq!(r.path, "/");
             assert_eq!(r.headers[0], ("Host".into(), "localhost".into()));
             assert!(r.body_head.is_empty());
-            r.response(200, "ok", "text/plain")
+            r.response(200, "ok", "text/plain", &[])
         });
         handle(&mut cur, handler).unwrap();
     }
@@ -316,7 +352,7 @@ mod tests {
             assert_eq!(r.method, "POST");
             let body = r.read_body().unwrap();
             assert_eq!(body, b"hello");
-            r.response(200, "received", "text/plain")
+            r.response(200, "received", "text/plain", &[])
         });
         handle(&mut cur, handler).unwrap();
     }
@@ -326,7 +362,7 @@ mod tests {
         let req = b"GET / HTTP/1.1\r\n\r\n";
         let mut cur = Cursor::new(req.to_vec());
         let handler: Handler = Arc::new(|mut r: Request| {
-            r.response(200, "Hello, World!", "text/plain")
+            r.response(200, "Hello, World!", "text/plain", &[])
         });
         handle(&mut cur, handler).unwrap();
         let resp = String::from_utf8(cur.into_inner()).unwrap();
@@ -340,7 +376,7 @@ mod tests {
         let handler: Handler = Arc::new(|mut r: Request| {
             let body = r.read_body().unwrap();
             assert!(body.is_empty());
-            r.response(200, "", "text/plain")
+            r.response(200, "", "text/plain", &[])
         });
         handle(&mut cur, handler).unwrap();
     }
@@ -355,7 +391,7 @@ mod tests {
         let handler: Handler = Arc::new(|mut r: Request| {
             let buf = r.read_body().unwrap();
             assert_eq!(buf, b"hello");
-            r.response(200, "ok", "text/plain")
+            r.response(200, "ok", "text/plain", &[])
         });
         handle(&mut cur, handler).unwrap();
     }
@@ -368,7 +404,7 @@ mod tests {
         let mut cur = Cursor::new(req.to_vec());
         let path = dir.to_string_lossy().to_string();
         let handler: Handler = Arc::new(move |mut r: Request| {
-            r.response_from_file(200, &path, "text/plain")
+            r.response_from_file(200, &path, "text/plain", &[])
         });
         handle(&mut cur, handler).unwrap();
         let resp = String::from_utf8(cur.into_inner()).unwrap();

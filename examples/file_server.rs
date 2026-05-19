@@ -6,16 +6,12 @@ fn main() {
     server.serve(|mut req: rust_https::Request| {
         let path = req.path.trim_start_matches('/').to_string();
         let path = if path.is_empty() { "index.html".into() } else { path };
-        if path.contains("..") {
-            let html = b"<html><body><h1>403 Forbidden</h1></body></html>";
-            return req.response(403, &html[..], "text/html");
-        }
         let ct = content_type(&path);
         match std::fs::metadata(&path) {
-            Ok(_) => req.response_from_file(200, &path, ct),
+            Ok(_) => req.response_from_file(200, &path, ct, &[]),
             Err(_) => {
                 let html = b"<html><body><h1>404 Not Found</h1></body></html>";
-                req.response(404, &html[..], "text/html")
+                req.response(404, &html[..], "text/html", &[])
             }
         }
     });

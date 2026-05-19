@@ -4,6 +4,6 @@ fn main() {
     server.serve(|mut req: rust_https::Request| {
         let body = req.read_body().unwrap_or_default();
         let html = format!("<!doctype html><html><body><h1>Hello, World!</h1> {:?}</body></html>", req);
-        req.response(200, html.as_bytes(), "text/html")
+        req.response(200, html.as_bytes(), "text/html", &[])
     });
 }
